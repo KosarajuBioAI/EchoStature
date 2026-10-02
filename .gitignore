@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+logs/
+*.mp4
+Dataset/
+data/
+# Paper drafts — do not publish
+*PSB*
+*psb*

@@ -1,0 +1,126 @@
+import argparse
+import yaml
+import torch
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+
+from .dataset import DualVideoEFDataset
+from .models.pt_efnet_real import PTEFNetReal
+
+
+def compute_metrics(preds, labels):
+    mae = np.mean(np.abs(preds - labels))
+    mse = np.mean((preds - labels) ** 2)
+    rmse = np.sqrt(mse)
+    denom = np.sum((labels - labels.mean()) ** 2)
+    r2 = 0.0 if denom == 0 else 1 - np.sum((labels - preds) ** 2) / denom
+    return mae, mse, rmse, r2
+
+
+def main():
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="ef_prediction/checkpoints/real_with_hcl_100/best.pth",
+    )
+    parser.add_argument(
+        "--tag",
+        type=str,
+        default=None,
+        help="If set, write real_{tag}_metrics.json instead of overwriting real_metrics.json.",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=str,
+        default=None,
+        help="Override val manifest (default: config data.val_manifest).",
+    )
+    parser.add_argument(
+        "--video-root",
+        type=str,
+        default=None,
+        help="Override video root (default: config data.original_video_dir).",
+    )
+    args = parser.parse_args()
+
+    with open("ef_prediction/config.yaml") as f:
+        cfg = yaml.safe_load(f)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    # Dataset
+    val_ds = DualVideoEFDataset(
+        manifest_path=args.manifest or cfg["data"]["val_manifest"],
+        video_root_dir=args.video_root or cfg["data"]["original_video_dir"],
+        video_length=cfg["model"]["video_length"],
+        video_size=cfg["model"]["video_size"],
+        fused=False
+    )
+
+    loader = DataLoader(val_ds, batch_size=8, shuffle=False)
+
+    backbone = cfg["model"].get("backbone", "resnet34")
+    model = PTEFNetReal(backbone=backbone).to(device)
+    model.load_state_dict(
+        torch.load(args.checkpoint, map_location=device)
+    )
+    model.eval()
+
+    preds, labels = [], []
+
+    with torch.no_grad():
+        for video, ef, _, _, _, demo_vec in tqdm(loader, desc="Evaluating Real Model"):
+            video = video.to(device)
+            ef = ef.to(device)
+            demo_vec = demo_vec.to(device).float()
+
+            pred, _ = model(video, demo_vec)
+
+            preds.extend(pred.cpu().numpy())
+            labels.extend(ef.cpu().numpy())
+
+    preds = np.array(preds) * 100
+    labels = np.array(labels) * 100
+
+    mae, mse, rmse, r2 = compute_metrics(preds, labels)
+
+    print("\nREAL MODEL RESULTS")
+    print(f"MAE  : {mae:.2f}")
+    print(f"MSE  : {mse:.2f}")
+    print(f"RMSE : {rmse:.2f}")
+    print(f"R2   : {r2:.4f}")
+
+    # Save results
+    out_dir = Path("ef_prediction/eval_results")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.DataFrame({
+        "True_EF": labels,
+        "Predicted_EF": preds,
+        "Error": preds - labels
+    })
+
+    stem = f"real_{args.tag}" if args.tag else "real"
+    df.to_csv(out_dir / f"{stem}_results.csv", index=False)
+
+    metrics = {
+        "checkpoint": args.checkpoint,
+        "MAE": float(mae),
+        "MSE": float(mse),
+        "RMSE": float(rmse),
+        "R2": float(r2)
+    }
+
+    pd.Series(metrics).to_json(out_dir / f"{stem}_metrics.json")
+
+    print(f"\nSaved {stem}_results.csv and {stem}_metrics.json")
+
+
+if __name__ == "__main__":
+    main()
